@@ -1329,14 +1329,14 @@ class Scheduler(SchedulerInterface):
 
         # TODO(Soya): need data from kv connector
         failed_kv_load_req_ids = None
-        if kv_connector_output and kv_connector_output.invalid_block_ids:
-            # These blocks contain externally computed tokens that failed to
-            # load. Identify affected requests and adjust their computed token
-            # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids = self._handle_invalid_blocks(
-                kv_connector_output.invalid_block_ids,
-                num_scheduled_tokens,
-            )
+        if kv_connector_output and kv_connector_output.failed_recving_req_ids:
+            failed_kv_load_req_ids = kv_connector_output.failed_recving_req_ids
+            async_failed_reqs = {
+                req_id for req_id in failed_kv_load_req_ids 
+                if self.requests[req_id].status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            }
+            self.failed_recving_kv_req_ids |= async_failed_reqs
+            failed_kv_load_req_ids -= async_failed_reqs 
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

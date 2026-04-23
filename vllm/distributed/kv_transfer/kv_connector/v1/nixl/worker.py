@@ -286,7 +286,9 @@ class NixlConnectorWorker:
         self._reqs_to_process: set[ReqId] = set()
 
         # invalid blocks from failed NIXL operations
-        self._invalid_block_ids: set[int] = set()
+        # TODO(Soya) remove _invalid_block_ids
+        # self._invalid_block_ids: set[int] = set()
+        self._invalid_req_ids:set[str] = set()
         # requests that skipped transfer (handshake or transfer failures)
         self._failed_recv_reqs: set[ReqId] = set()
 
@@ -1823,17 +1825,15 @@ class NixlConnectorWorker:
 
     def _handle_failed_transfer(self, req_id: str, handle: int):
         """
-        Handle a failed transfer by marking all (logical) blocks as invalid and
+        Handle a failed transfer by marking all requests as invalid and
         recording the failure.
 
         Args:
             req_id: The request ID.
             handle: The transfer handle.
         """
-        # Use .get() here as the metadata cleanup is handled by get_finished()
         # TODO (NickLucche) handle failed transfer for HMA.
-        if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
-            self._invalid_block_ids.update(meta.local_block_ids[0])
+        self._invalid_req_ids.add(req_id)
         self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
 
@@ -2315,15 +2315,15 @@ class NixlConnectorWorker:
             return self.xfer_stats.clone_and_reset()
         return None
 
-    def get_block_ids_with_load_errors(self) -> set[int]:
+    def get_req_ids_with_load_errors(self) -> set[str]:
         """
-        Return and clear the set of block IDs that failed to load.
+        Return and clear the set of request IDs that failed to load.
 
-        This is called by the scheduler to identify blocks that need
+        This is called by the scheduler to identify requests that need
         to be retried after a NIXL transfer failure.
         """
-        result = self._invalid_block_ids
-        self._invalid_block_ids = set()
+        result = self._invalid_req_ids
+        self._invalid_req_ids = set()
         return result
 
     def __del__(self):
