@@ -413,6 +413,7 @@ class EncoderCudaGraphManager:
                     outputs_by_orig_idx,
                     clone=True,
                     batch_mm_kwargs=batch_mm_kwargs,
+                    max_batch_size=self.max_batch_size,
                 )
 
         # Return in original batch order (caller maps outputs to token positions)

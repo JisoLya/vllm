@@ -923,6 +923,7 @@ class Step3VLForConditionalGeneration(
         dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
+        max_batch_size: int = 0,
     ):
         """CPU-side per-item merge after graph replay.
 
@@ -950,13 +951,17 @@ class Step3VLForConditionalGeneration(
         actual_np = [int(np) for np in num_patches]
         total_patches = sum(actual_np)
         img_tokens = bsz * img_out
+
+        # Since the img part is fixed, need to calculate the patch part
+        # offset based on max_batch_size
+        capture_img_tokens = max_batch_size * img_out
         patch_tokens = total_patches * patch_out
 
         img_part = output[:img_tokens].reshape(bsz, img_out, hidden)
         if total_patches > 0:
-            patch_part = output[img_tokens : img_tokens + patch_tokens].reshape(
-                -1, patch_out, hidden
-            )
+            patch_part = output[
+                capture_img_tokens : capture_img_tokens + patch_tokens
+            ].reshape(-1, patch_out, hidden)
         else:
             patch_part = None
 

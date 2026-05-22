@@ -1602,6 +1602,7 @@ class SupportsEncoderCudaGraph(Protocol):
         dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
         clone: bool = False,
         batch_mm_kwargs: dict[str, Any] | None = None,
+        max_batch_size: int = 0,
     ) -> None:
         """
         Post-process encoder output, directly call scatter_output_slices by default.
