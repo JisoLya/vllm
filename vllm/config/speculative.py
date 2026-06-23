@@ -54,8 +54,9 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+DominoModelTypes = Literal["domino"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes, DominoModelTypes
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -745,6 +746,8 @@ class SpeculativeConfig:
                     self.method = "eagle3"
                 elif "dflash" in self.draft_model_config.model.lower():
                     self.method = "dflash"
+                elif "domino" in self.draft_model_config.model.lower():
+                    self.method = "domino"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":

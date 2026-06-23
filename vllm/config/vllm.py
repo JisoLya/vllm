@@ -2028,7 +2028,7 @@ class VllmConfig:
             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
             if speculative_config.method in ("ngram", "ngram_gpu"):
                 unsupported.append("ngram/ngram_gpu speculative decoding")
-            elif speculative_config.method not in ("eagle", "eagle3", "mtp", "dflash"):
+            elif speculative_config.method not in ("eagle", "eagle3", "mtp", "dflash", "domino"):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             if speculative_config.uses_dynamic_speculative_decoding():
@@ -2039,6 +2039,7 @@ class VllmConfig:
             if (
                 speculative_config.parallel_drafting
                 and speculative_config.method != "dflash"
+                and speculative_config.method != "domino"
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
