@@ -518,7 +518,7 @@ class DFlashQwen3Model(nn.Module):
 
         Advances the GRU state with *token_ids* (the previously sampled
         token, or the block's bonus token on the first call), then produces
-        a vocabulary-sized bias from GRU hidden state fused with
+        a vocabulary-sized bias from the GRU hidden state fused with
         *parallel_hidden*.
 
         Returns:

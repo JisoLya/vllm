@@ -245,10 +245,20 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         """Domino's block-internal serial GRU refinement.
 
-        Computes base logits via the model's standard ``compute_logits``
-        (the same path DFlash uses), then serially refines each position
-        with a GRU-derived bias and samples via ``gumbel_sample`` (the same
-        kernel the plain DFlash path uses).
+        Reuses the model's standard ``compute_logits`` for base logits
+        (batch-computed over all K speculative positions), then runs a
+        serial per-position Domino-head loop::
+
+            gru_state  = GRU(embed(bonus_token),  zeros)
+            bias_0     = DominoMLP(h_0, gru_state)
+            token_0    = gumbel_sample(lm_logits_0 + bias_0)
+            gru_state  = GRU(embed(token_0), gru_state)
+            bias_1     = DominoMLP(h_1, gru_state)
+            token_1    = gumbel_sample(lm_logits_1 + bias_1)
+            ...
+
+        Each step reuses ``gumbel_sample`` — the same kernel the plain
+        DFlash path uses.
 
         Runs inside the same FULL CUDA graph as ``_run_model``.
         """
@@ -258,24 +268,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         block_hidden = last_hidden_states[: num_reqs * self.num_query_per_req].view(
             num_reqs, self.num_query_per_req, self.hidden_size
         )
-        # bonus token is at query offset 0; speculative positions are 1..K.
         bonus_token_ids = self.input_buffers.input_ids[
             : num_reqs * self.num_query_per_req
         ].view(num_reqs, self.num_query_per_req)[:, 0]
         refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
 
-        # --- base logits: reuse the model's standard compute_logits ---
+        # --- base logits: batch lm_head (same as DFlash) ---
         base_logits = self.model.compute_logits(
             refine_hidden.reshape(-1, self.hidden_size)
         ).view(num_reqs, K, -1)  # [num_reqs, K, vocab_size]
 
-        # --- serial GRU refinement: bias + gumbel_sample per step ---
+        # --- serial GRU refinement with token feedback ---
         gru_hidden = self.gru_hidden_buffer[:num_reqs]
         gru_hidden.zero_()
         token_ids = bonus_token_ids
         draft_token_list = []
 
         for step in range(K):
+            # ① GRU(bonus_token or prev_token, prev_state) → ② DominoMLP → bias
             bias, gru_hidden = self.model.refine_step_logits(
                 token_ids,
                 refine_hidden[:, step, :],
@@ -283,6 +293,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
             step_logits = base_logits[:, step, :] + bias  # [num_reqs, vocab_size]
 
+            # ③ gumbel_sample(lm_logits + bias) → draft token d_i
             next_token_id = gumbel_sample(
                 step_logits,
                 self.sample_idx_mapping[step::K][:num_reqs],
@@ -295,6 +306,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 use_fp64=self.use_fp64_gumbel,
             )
             draft_token_list.append(next_token_id)
+            # ④ token feedback: d_i carries into next GRU step
             token_ids = next_token_id
 
         return torch.stack(draft_token_list, dim=1)
