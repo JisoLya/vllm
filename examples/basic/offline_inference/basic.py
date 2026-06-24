@@ -19,12 +19,12 @@ def main():
     llm = LLM(
         model="/root/autodl-tmp/Qwen/Qwen3-4B",
         speculative_config={
-            # "method": "dflash",
-            # "model": "/root/autodl-tmp/Qwen/Qwen3-4B-DFlash-b16",
-            "method" : "domino",
-            "model": "/root/autodl-tmp/Qwen/Qwen3-4B-Domino-b16",
+            "model": "/root/autodl-tmp/Qwen/Qwen3-4B-DFlash-b16",
+            "method": "dflash",
+            # "model": "/root/autodl-tmp/Qwen/Qwen3-4B-Domino-b16",
             "num_speculative_tokens": 4,
-        }
+        },
+        enforce_eager=True,
     )
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects

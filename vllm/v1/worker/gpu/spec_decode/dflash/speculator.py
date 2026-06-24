@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     get_dflash_causal,
+    is_domino,
     load_dflash_model,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -46,6 +47,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.draft_model_config.hf_config
         )
 
+        self.is_domino = is_domino(self.draft_model_config)
         self.dflash_causal = get_dflash_causal(self.draft_model_config)
 
         # Buffers for context K/V precomputation. Populated by prepare_dflash_inputs,
@@ -75,6 +77,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.num_speculative_steps, dtype=torch.int32, device=device
         ).repeat(self.max_num_reqs)
 
+        self.gru_hidden_buffer = None
+        if self.is_domino:
+            gru_hidden_dim = self.draft_model_config.hf_config.dflash_config[
+                "gru_hidden_dim"
+            ]
+            self.gru_hidden_dim = gru_hidden_dim
+            self.gru_hidden_buffer = torch.zeros(
+                self.max_num_reqs, gru_hidden_dim, dtype=self.dtype, device=device
+            )
+
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
@@ -100,6 +112,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.zero_()
+        if self.gru_hidden_buffer is not None:
+            self.gru_hidden_buffer.zero_()
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -183,18 +197,24 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        draft_tokens = self.sample_draft(
-            sample_hidden_states,
-            self.sample_pos[:num_sample],
-            self.sample_idx_mapping[:num_sample],
-            self.temperature,
-            self.seeds,
-            self.sample_col[:num_sample],
-            self.draft_logits,
-        )
-        self.draft_tokens[:num_reqs] = draft_tokens.view(
-            num_reqs, self.num_speculative_steps
-        )
+        if self.is_domino:
+            draft_tokens = self._refine_and_sample(
+                last_hidden_states,
+                num_reqs,
+            )
+        else:
+            draft_tokens = self.sample_draft(
+                sample_hidden_states,
+                self.sample_pos[:num_sample],
+                self.sample_idx_mapping[:num_sample],
+                self.temperature,
+                self.seeds,
+                self.sample_col[:num_sample],
+                self.draft_logits,
+            )
+            self.draft_tokens[:num_reqs] = draft_tokens.view(
+                num_reqs, self.num_speculative_steps
+            )
 
     def _build_draft_attn_metadata(
         self,
@@ -214,6 +234,52 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_query_per_req=self.num_query_per_req,
             causal=causal,
         )
+
+    def _refine_and_sample(
+        self,
+        last_hidden_states: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Domino's block-internal serial GRU refinement, replacing the plain
+        per-position independent sampling that DFlash's sample_draft does.
+
+        Runs inside the same FULL CUDA graph as _run_model: since DFlash uses
+        FULL (not PIECEWISE) graphs, this loop must be capturable as part of
+        the same graph, not dispatched separately — it cannot use a separate
+        set_forward_context per step the way a PIECEWISE-based design would.
+        """
+        # bonus token's hidden state is at query offset 0 of each request;
+        # speculative (mask) positions are offsets 1..num_speculative_steps.
+        assert self.gru_hidden_buffer is not None and self.is_domino
+        block_hidden = last_hidden_states[: num_reqs * self.num_query_per_req].view(
+            num_reqs, self.num_query_per_req, self.hidden_size
+        )
+
+        bonus_token_ids = self.input_buffers.input_ids[
+            : num_reqs * self.num_query_per_req
+        ].view(num_reqs, self.num_query_per_req)[:, 0]
+
+        refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
+        base_logits = self.model.compute_logits(
+            refine_hidden.reshape(-1, self.hidden_size)
+        ).view(num_reqs, self.num_speculative_steps, -1)
+
+        gru_hidden = self.gru_hidden_buffer[:num_reqs]
+        gru_hidden.zero_()
+        token_ids = bonus_token_ids
+
+        draft_token_list = []
+        for step in range(self.num_speculative_steps):
+            next_token_id, gru_hidden = self.model.refine_step_forward(
+                token_ids,
+                refine_hidden[:, step, :],
+                base_logits[:, step, :],
+                gru_hidden,
+            )
+            draft_token_list.append(next_token_id)
+            token_ids = next_token_id
+
+        return torch.stack(draft_token_list, dim=1)
 
     @torch.inference_mode()
     def propose(

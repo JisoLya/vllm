@@ -3,6 +3,7 @@
 
 from collections.abc import Iterable
 
+import regex as re
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -213,6 +214,36 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class DominoPrefixGRUCell(nn.Module):
+    """Single-step GRU cell encoding the realized block prefix.
+
+    Mathematically equivalent to nn.GRU(num_layers=1, bias=False), but
+    exposes an explicit single-step forward so the proposer can call it
+    once per realized token without going through nn.GRU's variable-length
+    sequence interface (which doesn't fit a CUDA-graph-replayed loop).
+    Weight names (weight_ih_l0/weight_hh_l0) match nn.GRU's own naming,
+    so it loads the same checkpoint weights directly.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.weight_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size, input_size))
+        self.weight_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+
+    def forward(
+        self, input_embed: torch.Tensor, prev_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        gi = F.linear(input_embed, self.weight_ih_l0)
+        gh = F.linear(prev_hidden, self.weight_hh_l0)
+        i_r, i_z, i_n = gi.chunk(3, dim=-1)
+        h_r, h_z, h_n = gh.chunk(3, dim=-1)
+        reset_gate = torch.sigmoid(i_r + h_r)
+        update_gate = torch.sigmoid(i_z + h_z)
+        new_gate = torch.tanh(i_n + reset_gate * h_n)
+        return (1.0 - update_gate) * new_gate + update_gate * prev_hidden
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     def __init__(
@@ -282,6 +313,48 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+
+        projector_type = drafter_config.get("projector_type", None)
+        self.is_domino = projector_type == "domino"
+        if self.is_domino:
+            self.gru_hidden_dim = drafter_config["gru_hidden_dim"]
+            self.emb_dim = drafter_config["emb_dim"]
+
+            self.prefix_gru = DominoPrefixGRUCell(
+                input_size=self.config.hidden_size,
+                hidden_size=self.gru_hidden_dim,
+            )
+            in_dim = self.config.hidden_size + self.gru_hidden_dim
+            embed_proj_dims = drafter_config.get("embed_proj_dims")
+
+            if embed_proj_dims is None:
+                emb_dim = drafter_config["emb_dim"]
+                embed_proj_dims = [in_dim, emb_dim, self.config.vocab_size]
+            else:
+                assert embed_proj_dims[0] == in_dim, (
+                    f"embed_proj_dims[0]={embed_proj_dims[0]} must equal "
+                    f"hidden_size + gru_hidden_dim = {in_dim}"
+                )
+                assert embed_proj_dims[-1] == self.config.vocab_size, (
+                    f"embed_proj_dims[-1]={embed_proj_dims[-1]} must equal "
+                    f"vocab_size = {self.config.vocab_size}"
+                )
+
+            self.embed_proj = nn.ModuleList(
+                [
+                    ReplicatedLinear(
+                        input_size=embed_proj_dims[i],
+                        output_size=embed_proj_dims[i + 1],
+                        bias=False,
+                        params_dtype=vllm_config.model_config.dtype,
+                        quant_config=self.quant_config,
+                        prefix=maybe_prefix(prefix, f"embed_proj.{2 * i}"),
+                        return_bias=False,
+                    )
+                    for i in range(len(embed_proj_dims) - 1)
+                ]
+            )
+            self.embed_proj_act = nn.SiLU()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -435,6 +508,28 @@ class DFlashQwen3Model(nn.Module):
                 context_slot_mapping,
             )
 
+    def refine_step_forward(
+        self,
+        token_ids: torch.Tensor,
+        parallel_hidden: torch.Tensor,
+        base_logits: torch.Tensor,
+        gru_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.is_domino, "refine_step_forward requires projector_type='domino'"
+        token_embeds = self.embed_input_ids(token_ids)
+        new_gru_hidden = self.prefix_gru(token_embeds, gru_hidden)
+
+        x = torch.cat([parallel_hidden, new_gru_hidden], dim=-1)
+        for idx, layer in enumerate(self.embed_proj):
+            if idx == len(self.embed_proj) - 1:
+                x = layer(x)
+            else:
+                x = self.embed_proj_act(layer(x))
+
+        logits = base_logits + x
+        next_token_id = logits.argmax(dim=-1)
+        return next_token_id, new_gru_hidden
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -473,6 +568,10 @@ class DFlashQwen3Model(nn.Module):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
+            # replace embed_proj.{0, 2, 4, ...}.weight to
+            # embed_proj.{0, 1, 2, ...}.weight
+            if "embed_proj" in name:
+                name = re.sub(r"\d+", lambda x: str(int(x.group()) // 2), name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -529,6 +628,21 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def refine_step_forward(
+        self,
+        token_ids: torch.Tensor,
+        parallel_hidden: torch.Tensor,
+        base_logits: torch.Tensor,
+        gru_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.model.is_domino, (
+            "refine_step_forward requires projector_type='domino'"
+        )
+
+        return self.model.refine_step_forward(
+            token_ids, parallel_hidden, base_logits, gru_hidden
+        )
 
     def forward(
         self,

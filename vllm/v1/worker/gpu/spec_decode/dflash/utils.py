@@ -14,6 +14,11 @@ def get_dflash_causal(draft_model_config: ModelConfig) -> bool:
     return dflash_config.get("causal", False)
 
 
+def is_domino(draft_model_config: ModelConfig) -> bool:
+    dflash_config = getattr(draft_model_config.hf_config, "dflash_config", None) or {}
+    return dflash_config.get("projector_type", None) == "domino"
+
+
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
 
