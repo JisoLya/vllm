@@ -243,59 +243,52 @@ class DFlashSpeculator(DraftModelSpeculator):
         last_hidden_states: torch.Tensor,
         num_reqs: int,
     ) -> torch.Tensor:
-        """Domino's block-internal serial GRU refinement, replacing the plain
-        per-position independent sampling that DFlash's sample_draft does.
+        """Domino's block-internal serial GRU refinement.
 
-        Runs inside the same FULL CUDA graph as _run_model: since DFlash uses
-        FULL (not PIECEWISE) graphs, this loop must be capturable as part of
-        the same graph, not dispatched separately — it cannot use a separate
-        set_forward_context per step the way a PIECEWISE-based design would.
+        Computes base logits via the model's standard ``compute_logits``
+        (the same path DFlash uses), then serially refines each position
+        with a GRU-derived bias and samples via ``gumbel_sample`` (the same
+        kernel the plain DFlash path uses).
+
+        Runs inside the same FULL CUDA graph as ``_run_model``.
         """
-        # bonus token's hidden state is at query offset 0 of each request;
-        # speculative (mask) positions are offsets 1..num_speculative_steps.
         assert self.gru_hidden_buffer is not None and self.is_domino
 
         K = self.num_speculative_steps
         block_hidden = last_hidden_states[: num_reqs * self.num_query_per_req].view(
             num_reqs, self.num_query_per_req, self.hidden_size
         )
-
+        # bonus token is at query offset 0; speculative positions are 1..K.
         bonus_token_ids = self.input_buffers.input_ids[
             : num_reqs * self.num_query_per_req
         ].view(num_reqs, self.num_query_per_req)[:, 0]
-
         refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
 
+        # --- base logits: reuse the model's standard compute_logits ---
         base_logits = self.model.compute_logits(
             refine_hidden.reshape(-1, self.hidden_size)
         ).view(num_reqs, K, -1)  # [num_reqs, K, vocab_size]
 
+        # --- serial GRU refinement: bias + gumbel_sample per step ---
         gru_hidden = self.gru_hidden_buffer[:num_reqs]
         gru_hidden.zero_()
         token_ids = bonus_token_ids
         draft_token_list = []
 
         for step in range(K):
-            token_embeds = self.model.embed_input_ids(token_ids)  # [N, hidden]
-            gru_hidden = self.model.model.prefix_gru(
-                token_embeds, gru_hidden
-            )  # [N, gru_dim]
+            bias, gru_hidden = self.model.refine_step_logits(
+                token_ids,
+                refine_hidden[:, step, :],
+                gru_hidden,
+            )
+            step_logits = base_logits[:, step, :] + bias  # [num_reqs, vocab_size]
 
-            x = torch.cat([refine_hidden[:, step, :], gru_hidden], dim=-1)
-            for idx, layer in enumerate(self.model.model.embed_proj):
-                if idx == len(self.model.model.embed_proj) - 1:
-                    x = layer(x)  # [N, vocab_size]
-                else:
-                    x = self.model.model.embed_proj_act(layer(x))
-
-            step_logits = base_logits[:, step, :] + x  # [num_reqs, vocab_size]
-            num_so_far = step * num_reqs
             next_token_id = gumbel_sample(
                 step_logits,
-                self.sample_idx_mapping[step::K][:num_reqs],  # per-step idx_mapping
+                self.sample_idx_mapping[step::K][:num_reqs],
                 self.temperature,
                 self.seeds,
-                self.sample_pos[num_so_far : num_so_far + num_reqs] + 1,
+                self.sample_pos[step::K][:num_reqs] + 1,
                 apply_temperature=True,
                 output_processed_logits=None,
                 output_processed_logits_col=None,
