@@ -245,20 +245,12 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         """Domino's block-internal serial GRU refinement.
 
-        Reuses the model's standard ``compute_logits`` for base logits
-        (batch-computed over all K speculative positions), then runs a
-        serial per-position Domino-head loop::
-
-            gru_state  = GRU(embed(bonus_token),  zeros)
-            bias_0     = DominoMLP(h_0, gru_state)
-            token_0    = gumbel_sample(lm_logits_0 + bias_0)
-            gru_state  = GRU(embed(token_0), gru_state)
-            bias_1     = DominoMLP(h_1, gru_state)
-            token_1    = gumbel_sample(lm_logits_1 + bias_1)
-            ...
-
-        Each step reuses ``gumbel_sample`` — the same kernel the plain
-        DFlash path uses.
+        Base logits are batch-computed via ``compute_logits`` (same as the
+        plain DFlash path).  A serial GRU chain driven by the pre-computed
+        parallel hidden states (no token feedback) then produces per-position
+        bias logits.  All biases are added to the base logits and the
+        combined logits are sampled in a **single** ``gumbel_sample`` call —
+        the same kernel the plain DFlash path uses.
 
         Runs inside the same FULL CUDA graph as ``_run_model``.
         """
@@ -268,9 +260,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         block_hidden = last_hidden_states[: num_reqs * self.num_query_per_req].view(
             num_reqs, self.num_query_per_req, self.hidden_size
         )
-        bonus_token_ids = self.input_buffers.input_ids[
-            : num_reqs * self.num_query_per_req
-        ].view(num_reqs, self.num_query_per_req)[:, 0]
         refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
 
         # --- base logits: batch lm_head (same as DFlash) ---
@@ -278,38 +267,33 @@ class DFlashSpeculator(DraftModelSpeculator):
             refine_hidden.reshape(-1, self.hidden_size)
         ).view(num_reqs, K, -1)  # [num_reqs, K, vocab_size]
 
-        # --- serial GRU refinement with token feedback ---
+        # --- serial GRU over hidden states (no token feedback) ---
         gru_hidden = self.gru_hidden_buffer[:num_reqs]
         gru_hidden.zero_()
-        token_ids = bonus_token_ids
-        draft_token_list = []
-
+        bias_list = []
         for step in range(K):
-            # ① GRU(bonus_token or prev_token, prev_state) → ② DominoMLP → bias
             bias, gru_hidden = self.model.refine_step_logits(
-                token_ids,
                 refine_hidden[:, step, :],
                 gru_hidden,
             )
-            step_logits = base_logits[:, step, :] + bias  # [num_reqs, vocab_size]
+            bias_list.append(bias)
 
-            # ③ gumbel_sample(lm_logits + bias) → draft token d_i
-            next_token_id = gumbel_sample(
-                step_logits,
-                self.sample_idx_mapping[step::K][:num_reqs],
-                self.temperature,
-                self.seeds,
-                self.sample_pos[step::K][:num_reqs] + 1,
-                apply_temperature=True,
-                output_processed_logits=None,
-                output_processed_logits_col=None,
-                use_fp64=self.use_fp64_gumbel,
-            )
-            draft_token_list.append(next_token_id)
-            # ④ token feedback: d_i carries into next GRU step
-            token_ids = next_token_id
-
-        return torch.stack(draft_token_list, dim=1)
+        # --- single batched gumbel_sample for all positions ---
+        all_biases = torch.stack(bias_list, dim=1)  # [num_reqs, K, vocab_size]
+        refined_logits = base_logits + all_biases
+        num_sample = num_reqs * K
+        draft_tokens = gumbel_sample(
+            refined_logits.reshape(-1, refined_logits.shape[-1]),
+            self.sample_idx_mapping[:num_sample],
+            self.temperature,
+            self.seeds,
+            self.sample_pos[:num_sample] + 1,
+            apply_temperature=True,
+            output_processed_logits=None,
+            output_processed_logits_col=None,
+            use_fp64=self.use_fp64_gumbel,
+        )
+        return draft_tokens.view(num_reqs, K)
 
     @torch.inference_mode()
     def propose(

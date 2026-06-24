@@ -510,25 +510,27 @@ class DFlashQwen3Model(nn.Module):
 
     def refine_step_logits(
         self,
-        token_ids: torch.Tensor,
         parallel_hidden: torch.Tensor,
         gru_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One step of Domino GRU refinement.
 
-        Advances the GRU state with *token_ids* (the previously sampled
-        token, or the block's bonus token on the first call), then produces
-        a vocabulary-sized bias from the GRU hidden state fused with
-        *parallel_hidden*.
+        Advances the GRU state with *parallel_hidden* (the pre-computed
+        per-position hidden state from the parallel attention forward),
+        then produces a vocabulary-sized bias from the GRU hidden state
+        fused with the same *parallel_hidden*.
+
+        Since the GRU is driven entirely by the pre-computed hidden states
+        (no token feedback), all biases across the block can be computed
+        before any sampling.
 
         Returns:
             bias: [batch, vocab_size] additive logit correction.
             new_gru_hidden: [batch, gru_hidden_dim] GRU state after
-                folding in *token_ids*, ready for the next call.
+                folding in *parallel_hidden*, ready for the next call.
         """
         assert self.is_domino, "refine_step_logits requires projector_type='domino'"
-        token_embeds = self.embed_input_ids(token_ids)
-        new_gru_hidden = self.prefix_gru(token_embeds, gru_hidden)
+        new_gru_hidden = self.prefix_gru(parallel_hidden, gru_hidden)
 
         x = torch.cat([parallel_hidden, new_gru_hidden], dim=-1)
         for idx, layer in enumerate(self.embed_proj):
@@ -540,7 +542,6 @@ class DFlashQwen3Model(nn.Module):
 
     def refine_step_forward(
         self,
-        token_ids: torch.Tensor,
         parallel_hidden: torch.Tensor,
         base_logits: torch.Tensor,
         gru_hidden: torch.Tensor,
@@ -551,7 +552,7 @@ class DFlashQwen3Model(nn.Module):
         that do not need per-step sampling control.
         """
         bias, new_gru_hidden = self.refine_step_logits(
-            token_ids, parallel_hidden, gru_hidden
+            parallel_hidden, gru_hidden
         )
         next_token_id = (base_logits + bias).argmax(dim=-1)
         return next_token_id, new_gru_hidden
@@ -657,7 +658,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
 
     def refine_step_logits(
         self,
-        token_ids: torch.Tensor,
         parallel_hidden: torch.Tensor,
         gru_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -666,12 +666,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             "refine_step_logits requires projector_type='domino'"
         )
         return self.model.refine_step_logits(
-            token_ids, parallel_hidden, gru_hidden
+            parallel_hidden, gru_hidden
         )
 
     def refine_step_forward(
         self,
-        token_ids: torch.Tensor,
         parallel_hidden: torch.Tensor,
         base_logits: torch.Tensor,
         gru_hidden: torch.Tensor,
@@ -682,7 +681,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
 
         return self.model.refine_step_forward(
-            token_ids, parallel_hidden, base_logits, gru_hidden
+            parallel_hidden, base_logits, gru_hidden
         )
 
     def forward(
