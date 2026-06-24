@@ -23,7 +23,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     is_domino,
     load_dflash_model,
 )
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    DraftModelSpeculator,
+    gumbel_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 
 logger = init_logger(__name__)
@@ -212,9 +215,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_col[:num_sample],
                 self.draft_logits,
             )
-            self.draft_tokens[:num_reqs] = draft_tokens.view(
-                num_reqs, self.num_speculative_steps
-            )
+        self.draft_tokens[:num_reqs] = draft_tokens.view(
+            num_reqs, self.num_speculative_steps
+        )
 
     def _build_draft_attn_metadata(
         self,
@@ -251,6 +254,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # bonus token's hidden state is at query offset 0 of each request;
         # speculative (mask) positions are offsets 1..num_speculative_steps.
         assert self.gru_hidden_buffer is not None and self.is_domino
+
+        K = self.num_speculative_steps
         block_hidden = last_hidden_states[: num_reqs * self.num_query_per_req].view(
             num_reqs, self.num_query_per_req, self.hidden_size
         )
@@ -260,21 +265,41 @@ class DFlashSpeculator(DraftModelSpeculator):
         ].view(num_reqs, self.num_query_per_req)[:, 0]
 
         refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
+
         base_logits = self.model.compute_logits(
             refine_hidden.reshape(-1, self.hidden_size)
-        ).view(num_reqs, self.num_speculative_steps, -1)
+        ).view(num_reqs, K, -1)  # [num_reqs, K, vocab_size]
 
         gru_hidden = self.gru_hidden_buffer[:num_reqs]
         gru_hidden.zero_()
         token_ids = bonus_token_ids
-
         draft_token_list = []
-        for step in range(self.num_speculative_steps):
-            next_token_id, gru_hidden = self.model.refine_step_forward(
-                token_ids,
-                refine_hidden[:, step, :],
-                base_logits[:, step, :],
-                gru_hidden,
+
+        for step in range(K):
+            token_embeds = self.model.embed_input_ids(token_ids)  # [N, hidden]
+            gru_hidden = self.model.model.prefix_gru(
+                token_embeds, gru_hidden
+            )  # [N, gru_dim]
+
+            x = torch.cat([refine_hidden[:, step, :], gru_hidden], dim=-1)
+            for idx, layer in enumerate(self.model.model.embed_proj):
+                if idx == len(self.model.model.embed_proj) - 1:
+                    x = layer(x)  # [N, vocab_size]
+                else:
+                    x = self.model.model.embed_proj_act(layer(x))
+
+            step_logits = base_logits[:, step, :] + x  # [num_reqs, vocab_size]
+            num_so_far = step * num_reqs
+            next_token_id = gumbel_sample(
+                step_logits,
+                self.sample_idx_mapping[step::K][:num_reqs],  # per-step idx_mapping
+                self.temperature,
+                self.seeds,
+                self.sample_pos[num_so_far : num_so_far + num_reqs] + 1,
+                apply_temperature=True,
+                output_processed_logits=None,
+                output_processed_logits_col=None,
+                use_fp64=self.use_fp64_gumbel,
             )
             draft_token_list.append(next_token_id)
             token_ids = next_token_id
