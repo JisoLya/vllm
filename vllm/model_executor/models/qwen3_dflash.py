@@ -508,55 +508,6 @@ class DFlashQwen3Model(nn.Module):
                 context_slot_mapping,
             )
 
-    def refine_step_logits(
-        self,
-        parallel_hidden: torch.Tensor,
-        gru_hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One step of Domino GRU refinement.
-
-        Advances the GRU state with *parallel_hidden* (the pre-computed
-        per-position hidden state from the parallel attention forward),
-        then produces a vocabulary-sized bias from the GRU hidden state
-        fused with the same *parallel_hidden*.
-
-        Since the GRU is driven entirely by the pre-computed hidden states
-        (no token feedback), all biases across the block can be computed
-        before any sampling.
-
-        Returns:
-            bias: [batch, vocab_size] additive logit correction.
-            new_gru_hidden: [batch, gru_hidden_dim] GRU state after
-                folding in *parallel_hidden*, ready for the next call.
-        """
-        assert self.is_domino, "refine_step_logits requires projector_type='domino'"
-        new_gru_hidden = self.prefix_gru(parallel_hidden, gru_hidden)
-
-        x = torch.cat([parallel_hidden, new_gru_hidden], dim=-1)
-        for idx, layer in enumerate(self.embed_proj):
-            if idx == len(self.embed_proj) - 1:
-                x = layer(x)
-            else:
-                x = self.embed_proj_act(layer(x))
-        return x, new_gru_hidden
-
-    def refine_step_forward(
-        self,
-        parallel_hidden: torch.Tensor,
-        base_logits: torch.Tensor,
-        gru_hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One refinement step that samples the next token (greedy).
-
-        Convenience wrapper around :meth:`refine_step_logits` for callers
-        that do not need per-step sampling control.
-        """
-        bias, new_gru_hidden = self.refine_step_logits(
-            parallel_hidden, gru_hidden
-        )
-        next_token_id = (base_logits + bias).argmax(dim=-1)
-        return next_token_id, new_gru_hidden
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -648,6 +599,25 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         else:
             self.draft_id_to_target_id = None
 
+        # --- Domino buffers (pre-allocated, shared across forward / compute_logits) ---
+        if self.model.is_domino:
+            assert vllm_config.speculative_config is not None
+            self.num_speculative_steps = (
+                vllm_config.speculative_config.num_speculative_tokens
+            )
+            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            self._domino_gru_buffer = torch.zeros(
+                max_num_reqs,
+                self.model.gru_hidden_dim,
+                dtype=vllm_config.model_config.dtype,
+            )
+            max_num_samples = max_num_reqs * self.num_speculative_steps
+            self._domino_bias_buffer = torch.zeros(
+                max_num_samples,
+                self.config.draft_vocab_size,
+                dtype=vllm_config.model_config.dtype,
+            )
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -656,47 +626,54 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     ) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def refine_step_logits(
-        self,
-        parallel_hidden: torch.Tensor,
-        gru_hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One Domino GRU refinement step → bias logits + new GRU state."""
-        assert self.model.is_domino, (
-            "refine_step_logits requires projector_type='domino'"
-        )
-        return self.model.refine_step_logits(
-            parallel_hidden, gru_hidden
-        )
-
-    def refine_step_forward(
-        self,
-        parallel_hidden: torch.Tensor,
-        base_logits: torch.Tensor,
-        gru_hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One refinement step that samples the next token (greedy)."""
-        assert self.model.is_domino, (
-            "refine_step_forward requires projector_type='domino'"
-        )
-
-        return self.model.refine_step_forward(
-            parallel_hidden, base_logits, gru_hidden
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, inputs_embeds)
+
+        if not self.model.is_domino:
+            return hidden_states
+
+        # --- Domino: compute GRU biases in-place on the forward output ---
+        K = self.num_speculative_steps
+        num_reqs = input_ids.shape[0] // (K + 1)
+
+        block_hidden = hidden_states.view(num_reqs, K + 1, self.config.hidden_size)
+        refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
+
+        gru_hidden = self._domino_gru_buffer[:num_reqs]
+        gru_hidden.zero_()
+        bias_flat = self._domino_bias_buffer
+        bias_flat.zero_()
+
+        for step in range(K):
+            gru_hidden = self.model.prefix_gru(refine_hidden[:, step, :], gru_hidden)
+            x = torch.cat([refine_hidden[:, step, :], gru_hidden], dim=-1)
+            for idx, layer in enumerate(self.model.embed_proj):
+                if idx == len(self.model.embed_proj) - 1:
+                    x = layer(x)
+                else:
+                    x = self.model.embed_proj_act(layer(x))
+            # Store with request-major strided layout to match sample_indices:
+            #   step 0 → bias_flat[0::K], step 1 → bias_flat[1::K], ...
+            bias_flat[step::K] = x
+
+        return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+
+        if self.model.is_domino:
+            # Add the GRU-derived bias computed during forward().
+            n = logits.shape[0]
+            logits = logits + self._domino_bias_buffer[:n]
+
         if self.draft_id_to_target_id is None:
             return logits
 
