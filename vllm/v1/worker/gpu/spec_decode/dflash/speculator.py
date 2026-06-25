@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
     get_dflash_causal,
+    is_domino,
     load_dflash_model,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import (
@@ -49,7 +50,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.draft_model_config.hf_config
         )
 
+        self.is_domino = is_domino(self.draft_model_config)
         self.dflash_causal = get_dflash_causal(self.draft_model_config)
+
+        if self.is_domino:
+            gru_hidden_dim = self.draft_model_config.hf_config.dflash_config[
+                "gru_hidden_dim"
+            ]
+            self.gru_hidden_buffer = torch.zeros(
+                self.max_num_reqs, gru_hidden_dim, dtype=self.dtype, device=device
+            )
+        else:
+            self.gru_hidden_buffer = None
 
         # Buffers for context K/V precomputation. Populated by prepare_dflash_inputs,
         # and processed by the model's precompute_and_store_context_kv method.
@@ -103,6 +115,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.zero_()
+        if self.gru_hidden_buffer is not None:
+            self.gru_hidden_buffer.zero_()
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -186,18 +200,94 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        draft_tokens = self.sample_draft(
-            sample_hidden_states,
-            self.sample_pos[:num_sample],
-            self.sample_idx_mapping[:num_sample],
-            self.temperature,
-            self.seeds,
-            self.sample_col[:num_sample],
-            self.draft_logits,
-        )
+        if self.is_domino:
+            draft_tokens = self._refine_and_sample(
+                last_hidden_states,
+                num_reqs,
+            )
+        else:
+            draft_tokens = self.sample_draft(
+                sample_hidden_states,
+                self.sample_pos[:num_sample],
+                self.sample_idx_mapping[:num_sample],
+                self.temperature,
+                self.seeds,
+                self.sample_col[:num_sample],
+                self.draft_logits,
+            )
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
+
+    def _refine_and_sample(
+        self,
+        last_hidden_states: torch.Tensor,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Domino serial GRU refinement with real token feedback.
+
+        Base logits are batch-computed via ``compute_logits`` (same as DFlash).
+        A serial GRU chain driven by ``gumbel_sample`` results (real token
+        feedback) produces per-position bias logits::
+
+            gru_state  = GRU(embed(bonus),                zeros)
+            bias_0     = DominoMLP(h_0, gru_state)
+            token_0    = gumbel_sample(lm_logits_0 + bias_0)
+            gru_state  = GRU(embed(token_0), gru_state)
+            bias_1     = DominoMLP(h_1, gru_state)
+            token_1    = gumbel_sample(lm_logits_1 + bias_1)
+            ...
+
+        Each step reuses ``gumbel_sample`` — the same kernel the plain DFlash
+        path uses.
+
+        Runs inside the same FULL CUDA graph as ``_run_model``.
+        """
+        assert self.gru_hidden_buffer is not None and self.is_domino
+
+        K = self.num_speculative_steps
+        block_hidden = last_hidden_states[: num_reqs * self.num_query_per_req].view(
+            num_reqs, self.num_query_per_req, self.hidden_size
+        )
+        bonus_token_ids = self.input_buffers.input_ids[
+            : num_reqs * self.num_query_per_req
+        ].view(num_reqs, self.num_query_per_req)[:, 0]
+        refine_hidden = block_hidden[:, 1:, :]  # [num_reqs, K, hidden_size]
+
+        # --- base logits: batch lm_head (same as DFlash) ---
+        base_logits = self.model.compute_logits(
+            refine_hidden.reshape(-1, self.hidden_size)
+        ).view(num_reqs, K, -1)  # [num_reqs, K, vocab_size]
+
+        # --- serial GRU with per-step gumbel_sample token feedback ---
+        gru_hidden = self.gru_hidden_buffer[:num_reqs]
+        gru_hidden.zero_()
+        token_ids = bonus_token_ids
+        draft_token_list = []
+
+        for step in range(K):
+            bias, gru_hidden = self.model.refine_step_logits(
+                token_ids,
+                refine_hidden[:, step, :],
+                gru_hidden,
+            )
+            step_logits = base_logits[:, step, :] + bias  # [num_reqs, vocab_size]
+
+            next_token_id = gumbel_sample(
+                step_logits,
+                self.sample_idx_mapping[step::K][:num_reqs],
+                self.temperature,
+                self.seeds,
+                self.sample_pos[step::K][:num_reqs] + 1,
+                apply_temperature=True,
+                output_processed_logits=None,
+                output_processed_logits_col=None,
+                use_fp64=self.use_fp64_gumbel,
+            )
+            draft_token_list.append(next_token_id)
+            token_ids = next_token_id  # real token feedback
+
+        return torch.stack(draft_token_list, dim=1)
 
     def _build_draft_attn_metadata(
         self,
