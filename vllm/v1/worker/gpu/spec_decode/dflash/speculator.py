@@ -226,6 +226,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs, self.num_speculative_steps
         )
 
+    @torch.inference_mode()
     def _refine_and_sample(
         self,
         last_hidden_states: torch.Tensor,
@@ -237,12 +238,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         A serial GRU chain driven by ``gumbel_sample`` results (real token
         feedback) produces per-position bias logits::
 
-            gru_state  = GRU(embed(bonus),                zeros)
-            bias_0     = DominoMLP(h_0, gru_state)
-            token_0    = gumbel_sample(lm_logits_0 + bias_0)
-            gru_state  = GRU(embed(token_0), gru_state)
-            bias_1     = DominoMLP(h_1, gru_state)
-            token_1    = gumbel_sample(lm_logits_1 + bias_1)
+            gru_state = GRU(embed(bonus), zeros)
+            bias_0 = DominoMLP(h_0, gru_state)
+            token_0 = gumbel_sample(lm_logits_0 + bias_0)
+            gru_state = GRU(embed(token_0), gru_state)
+            bias_1 = DominoMLP(h_1, gru_state)
+            token_1 = gumbel_sample(lm_logits_1 + bias_1)
             ...
 
         Each step reuses ``gumbel_sample`` — the same kernel the plain DFlash

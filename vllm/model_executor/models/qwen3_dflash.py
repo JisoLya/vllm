@@ -231,17 +231,20 @@ class DominoPrefixGRUCell(nn.Module):
         self.weight_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size, input_size))
         self.weight_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
 
-    def forward(self, input_embed: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+    @torch.compile
+    def forward(
+        self, input_embed: torch.Tensor, prev_hidden: torch.Tensor
+    ) -> torch.Tensor:
         gi = F.linear(input_embed, self.weight_ih_l0)
         gh = F.linear(prev_hidden, self.weight_hh_l0)
-        
+
         batch_size = gi.shape[0]
         gi_fused = gi.view(batch_size, 3, self.hidden_size)
         gh_fused = gh.view(batch_size, 3, self.hidden_size)
-        
+
         reset_gate = torch.sigmoid(gi_fused[:, 0, :] + gh_fused[:, 0, :])
         update_gate = torch.sigmoid(gi_fused[:, 1, :] + gh_fused[:, 1, :])
-        
+
         new_gate = torch.tanh(gi_fused[:, 2, :] + reset_gate * gh_fused[:, 2, :])
         return (1.0 - update_gate) * new_gate + update_gate * prev_hidden
 
