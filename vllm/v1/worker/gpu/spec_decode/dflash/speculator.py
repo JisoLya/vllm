@@ -60,8 +60,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.gru_hidden_buffer = torch.zeros(
                 self.max_num_reqs, gru_hidden_dim, dtype=self.dtype, device=device
             )
+            self._domino_cat_buf = torch.zeros(
+                self.max_num_reqs,
+                self.hidden_size + gru_hidden_dim,
+                dtype=self.dtype,
+                device=device,
+            )
         else:
             self.gru_hidden_buffer = None
+            self._domino_cat_buf = None
 
         # Buffers for context K/V precomputation. Populated by prepare_dflash_inputs,
         # and processed by the model's precompute_and_store_context_kv method.
@@ -264,12 +271,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         gru_hidden.zero_()
         token_ids = bonus_token_ids
         draft_token_list = []
+        cat_buf = self._domino_cat_buf[:num_reqs]
 
         for step in range(K):
             bias, gru_hidden = self.model.refine_step_logits(
                 token_ids,
                 refine_hidden[:, step, :],
                 gru_hidden,
+                cat_out=cat_buf,
             )
             step_logits = base_logits[:, step, :] + bias  # [num_reqs, vocab_size]
 

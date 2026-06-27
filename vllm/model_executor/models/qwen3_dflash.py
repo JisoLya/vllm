@@ -231,16 +231,18 @@ class DominoPrefixGRUCell(nn.Module):
         self.weight_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size, input_size))
         self.weight_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
 
-    def forward(
-        self, input_embed: torch.Tensor, prev_hidden: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, input_embed: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
         gi = F.linear(input_embed, self.weight_ih_l0)
         gh = F.linear(prev_hidden, self.weight_hh_l0)
-        i_r, i_z, i_n = gi.chunk(3, dim=-1)
-        h_r, h_z, h_n = gh.chunk(3, dim=-1)
-        reset_gate = torch.sigmoid(i_r + h_r)
-        update_gate = torch.sigmoid(i_z + h_z)
-        new_gate = torch.tanh(i_n + reset_gate * h_n)
+        
+        batch_size = gi.shape[0]
+        gi_fused = gi.view(batch_size, 3, self.hidden_size)
+        gh_fused = gh.view(batch_size, 3, self.hidden_size)
+        
+        reset_gate = torch.sigmoid(gi_fused[:, 0, :] + gh_fused[:, 0, :])
+        update_gate = torch.sigmoid(gi_fused[:, 1, :] + gh_fused[:, 1, :])
+        
+        new_gate = torch.tanh(gi_fused[:, 2, :] + reset_gate * gh_fused[:, 2, :])
         return (1.0 - update_gate) * new_gate + update_gate * prev_hidden
 
 
@@ -513,6 +515,7 @@ class DFlashQwen3Model(nn.Module):
         token_ids: torch.Tensor,
         parallel_hidden: torch.Tensor,
         gru_hidden: torch.Tensor,
+        cat_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One Domino GRU step with token feedback.
 
@@ -520,6 +523,18 @@ class DFlashQwen3Model(nn.Module):
         draft token, or the block's bonus token on the first call), then
         produces a vocabulary-sized bias from the GRU hidden state fused
         with *parallel_hidden*.
+
+        Args:
+            token_ids: [batch] previously sampled draft token ids.
+            parallel_hidden: [batch, hidden_size] DFlash output at this
+                speculative position.
+            gru_hidden: [batch, gru_hidden_dim] GRU state from the
+                previous refinement step.
+            cat_out: Optional [batch, hidden_size + gru_hidden_dim]
+                buffer that will be filled with the concatenation of
+                *parallel_hidden* and the new GRU hidden state.  When
+                provided the intermediate ``torch.cat`` allocation is
+                avoided.
 
         Returns:
             bias: [batch, vocab_size] additive logit correction.
@@ -530,7 +545,12 @@ class DFlashQwen3Model(nn.Module):
         token_embeds = self.embed_input_ids(token_ids)
         new_gru_hidden = self.prefix_gru(token_embeds, gru_hidden)
 
-        x = torch.cat([parallel_hidden, new_gru_hidden], dim=-1)
+        if cat_out is not None:
+            cat_out[:, : self.config.hidden_size].copy_(parallel_hidden)
+            cat_out[:, self.config.hidden_size :].copy_(new_gru_hidden)
+            x = cat_out
+        else:
+            x = torch.cat([parallel_hidden, new_gru_hidden], dim=-1)
         for idx, layer in enumerate(self.embed_proj):
             if idx == len(self.embed_proj) - 1:
                 x = layer(x)
@@ -642,10 +662,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         token_ids: torch.Tensor,
         parallel_hidden: torch.Tensor,
         gru_hidden: torch.Tensor,
+        cat_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One Domino GRU step → bias logits + new GRU state."""
         return self.model.refine_step_logits(
-            token_ids, parallel_hidden, gru_hidden
+            token_ids, parallel_hidden, gru_hidden, cat_out=cat_out
         )
 
     def forward(
